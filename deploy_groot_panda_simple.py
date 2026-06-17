@@ -10,9 +10,7 @@ no Polymetis, no DROID. Talks directly to the Franka FCI via panda-py
 Install (one Python 3.10+ env):
 
     pip install -e /path/to/Isaac-GR00T[base]
-    pip install panda-python opencv-python numpy
-    # optional (faster attention):
-    # pip install --no-build-isolation flash-attn==2.7.1.post4
+    pip install panda-python opencv-python numpy pandas pyarrow
 
 Run (dry; no robot motion):
 
@@ -25,13 +23,19 @@ Run (live):
 
     python deploy_groot_panda_simple.py ... --robot-ip 172.16.0.2 --confirm-real
 
+Run with dataset-derived init pose + debug + per-chunk approval:
+
+    python deploy_groot_panda_simple.py ... --init-dataset /path/to/dataset \\
+        --debug --safe --confirm-real
+
 Controls
 --------
   S       Start: run inference, show chunk preview.
-  A/Enter Approve & execute the pending chunk; later chunks auto-execute.
+  A/Enter Approve & execute the pending chunk; later chunks auto-execute
+          unless --safe is set.
   R       Reject — fresh inference.
   P       Pause (mid-chunk too): stop controller, re-arm approval.
-  I       Move to Franka home pose (joint move).
+  I       Move to init pose (dataset init pose if --init-dataset, else Franka home).
   Q/Esc   Quit.
 
 Safety
@@ -40,11 +44,11 @@ Safety
 - Joint torque outputs from the model are NOT executed (auxiliary head).
 - Without --confirm-real, robot motion is fully suppressed (dry mode).
 - FIRST chunk after S/I/P always requires A approval.
+- --safe makes every chunk require approval.
 """
 
 import argparse
 import datetime
-import os
 import select
 import sys
 import termios
@@ -88,7 +92,6 @@ class KeyboardListener:
 # GR00T policy
 # ─────────────────────────────────────────────────────────────────────
 def load_modality_config(modality_path: str):
-    """Side-effect import: register_modality_config runs at module load."""
     import importlib.util
     p = Path(modality_path)
     if not p.exists():
@@ -134,7 +137,7 @@ class PandaClient:
 
         print(f"[robot] Connecting to Franka at {robot_ip}")
         self.panda = panda_py.Panda(robot_ip)
-        self.controller = None      # set on start_impedance
+        self.controller = None
         self.controller_running = False
 
         self.gripper = None
@@ -165,7 +168,7 @@ class PandaClient:
             try:
                 g = self.gripper.read_once()
                 g_width = float(g.width)
-                g_vel = 0.0  # libfranka gripper state has no velocity field
+                g_vel = 0.0
                 self._last_gripper_width = g_width
             except Exception:
                 g_width, g_vel = self._last_gripper_width, 0.0
@@ -215,19 +218,38 @@ class PandaClient:
         if abs(target_width - self._last_gripper_width) < 0.005:
             return
         try:
-            # libfranka.Gripper.move is blocking; for low-latency use a thread.
-            # Here we issue it inline and rely on --gripper-every to keep cadence.
             self.gripper.move(target_width, speed)
             self._last_gripper_width = target_width
         except Exception as e:
             print(f"[robot] gripper move failed: {e}")
 
     # ── Home ─────────────────────────────────────────────────────
-    def go_home(self):
+    def go_home(self, joint_target: np.ndarray | None = None,
+                gripper_width: float | None = None):
+        """If joint_target is given, move there. Otherwise canonical Franka home."""
         self.stop_impedance()
-        print("[robot] Moving to home pose...")
-        self.panda.move_to_start()
-        print("[robot] At home.")
+        if joint_target is not None:
+            print(f"[robot] Moving to dataset init joint pose {joint_target}")
+            tgt = joint_target.astype(np.float64)
+            if hasattr(self.panda, "move_to_joint_position"):
+                self.panda.move_to_joint_position(tgt, speed_factor=0.2)
+            elif hasattr(self.panda, "move_to_joint_positions"):
+                self.panda.move_to_joint_positions(tgt, speed_factor=0.2)
+            else:
+                print("[robot] WARNING: no move_to_joint_position{,s} method; "
+                      "falling back to move_to_start()")
+                self.panda.move_to_start()
+        else:
+            print("[robot] Moving to Franka home pose...")
+            self.panda.move_to_start()
+        if self.gripper is not None and gripper_width is not None:
+            try:
+                target = float(np.clip(gripper_width, 0.0, MAX_GRIPPER_WIDTH))
+                self.gripper.move(target, 0.1)
+                self._last_gripper_width = target
+            except Exception as e:
+                print(f"[robot] gripper init move failed: {e}")
+        print("[robot] At init pose.")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -316,6 +338,57 @@ def build_state_dict(state: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Dataset init pose loader (gr00t LeRobot v2 parquet layout)
+# ─────────────────────────────────────────────────────────────────────
+def load_init_pose_from_dataset(dataset_dir: str, episode_idx: int = 0) -> dict:
+    """Return the first-frame state of `episode_idx` in a LeRobot dataset.
+
+    Expected layout:
+        <dataset_dir>/data/chunk-XXX/episode_NNNNNN.parquet
+    Column 'observation.state' must contain the 25 panda_laas scalars in
+    the order specified by meta/info.json (joint_pos_1..7, joint_vel_1..7,
+    ee_pos_xyz, ee_quat_xyzw, gripper_pos_l/r, gripper_vel_l/r).
+    """
+    import pandas as pd
+    import json
+    info_path = Path(dataset_dir) / "meta" / "info.json"
+    if info_path.exists():
+        info = json.load(open(info_path))
+        chunks_size = info.get("chunks_size", 1000)
+        data_path_tmpl = info.get("data_path",
+            "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
+    else:
+        chunks_size = 1000
+        data_path_tmpl = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+    chunk = episode_idx // chunks_size
+    rel = data_path_tmpl.format(episode_chunk=chunk, episode_index=episode_idx)
+    parquet_path = Path(dataset_dir) / rel
+    if not parquet_path.exists():
+        candidates = sorted((Path(dataset_dir) / "data").rglob("*.parquet"))
+        if not candidates:
+            raise FileNotFoundError(f"No parquet under {dataset_dir}/data")
+        parquet_path = candidates[0]
+        print(f"[init] Episode {episode_idx} not found; using {parquet_path.name}")
+    df = pd.read_parquet(parquet_path)
+    state0 = np.asarray(df.iloc[0]["observation.state"], dtype=np.float32)
+    out = {
+        "joint_pos":      state0[0:7],
+        "joint_vel":      state0[7:14],
+        "ee_pos":         state0[14:17],
+        "ee_quat_xyzw":   state0[17:21],
+        "gripper_pos_l":  float(state0[21]),
+        "gripper_pos_r":  float(state0[22]),
+        "source_parquet": str(parquet_path),
+    }
+    print(f"[init] Loaded init pose from {parquet_path.name}:")
+    print(f"  joint_pos = {out['joint_pos']}")
+    print(f"  ee_pos    = {out['ee_pos']}")
+    print(f"  ee_quat   = {out['ee_quat_xyzw']}")
+    print(f"  gripper   = {out['gripper_pos_l']:.3f} (mirrored L/R)")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Action chunk handling
 # ─────────────────────────────────────────────────────────────────────
 PANDA_ACTION_KEYS = [
@@ -380,7 +453,7 @@ def main():
 
     # Robot
     p.add_argument("--robot-ip", default="172.16.0.2",
-                   help="Franka FCI IP. panda-py talks directly to it.")
+                   help="Franka FCI IP.")
     p.add_argument("--no-gripper", action="store_true")
 
     # Cameras
@@ -402,9 +475,17 @@ def main():
     p.add_argument("--confirm-real", action="store_true",
                    help="Enable real robot motion. Without this, dry mode only.")
     p.add_argument("--safe", action="store_true",
-                   help="Require A-key approval before EVERY chunk. Without "
-                        "this, only the first chunk waits and subsequent "
-                        "chunks auto-execute. Use --safe for cautious runs.")
+                   help="Require A-key approval before EVERY chunk.")
+    p.add_argument("--debug", action="store_true",
+                   help="Print proprio, first action, quat sanity, dump cam frames.")
+
+    # Init pose from dataset
+    p.add_argument("--init-dataset", default=None,
+                   help="Path to a LeRobot v2 dataset dir. On I press the robot "
+                        "moves to the joint pose of the first frame of episode "
+                        "--init-episode, instead of Franka's canonical home.")
+    p.add_argument("--init-episode", type=int, default=0)
+
     p.add_argument("--record-dir", default="./runs")
     args = p.parse_args()
 
@@ -414,6 +495,11 @@ def main():
 
     # ── Connect robot ───────────────────────────────────────────
     robot = PandaClient(args.robot_ip, use_gripper=not args.no_gripper)
+
+    # ── Dataset init pose (optional) ────────────────────────────
+    init_pose = None
+    if args.init_dataset:
+        init_pose = load_init_pose_from_dataset(args.init_dataset, args.init_episode)
 
     # ── Cameras ─────────────────────────────────────────────────
     if args.no_cameras:
@@ -449,6 +535,19 @@ def main():
             "state":    build_state_dict(state),
             "language": {"annotation.human.action.task_description": [[args.task]]},
         }
+        if args.debug:
+            print("\n[debug] STATE sent to model:")
+            print(f"  joint_pos = {state['joint_pos']}")
+            print(f"  joint_vel = {state['joint_vel']}")
+            print(f"  ee_pos    = {state['ee_pos']}")
+            print(f"  ee_quat (xyzw) = {state['ee_quat']}  |q|={np.linalg.norm(state['ee_quat']):.4f}")
+            print(f"  gripper_w = {state['gripper_width']:.3f}")
+            if init_pose is not None:
+                jp_drift = state['joint_pos'] - init_pose['joint_pos']
+                ee_drift = state['ee_pos']    - init_pose['ee_pos']
+                print(f"  drift vs dataset init: joint max |delta| = "
+                      f"{np.abs(jp_drift).max():.3f} rad, ee delta = "
+                      f"{ee_drift} (|delta|={np.linalg.norm(ee_drift):.3f} m)")
         t0 = time.time()
         action, _ = policy.get_action(obs)
         dt = time.time() - t0
@@ -456,6 +555,23 @@ def main():
         print(f"\n[infer] {dt*1000:.0f} ms  chunk={chunk.shape}")
         print("[infer] preview:")
         print(summarize_chunk(chunk, current_xyz))
+        if args.debug:
+            q0 = chunk[0, 3:7]
+            cur_q = state["ee_quat"]
+            print("[debug] FIRST ACTION:")
+            print(f"  ee_pos     = {chunk[0, 0:3]}")
+            print(f"  ee_quat    = {q0}  |q|={np.linalg.norm(q0):.4f}")
+            print(f"  gripper    = {chunk[0, 7]:.3f}")
+            print(f"  torque[7]  = {chunk[0, 8:15]}")
+            print(f"  quat_dot(cur, action[0]) = "
+                  f"{abs(float(np.dot(cur_q, q0))):.4f} "
+                  f"(near 1.0 = orientations agree, near 0 = swapped/garbage)")
+            if cams is not None:
+                import cv2
+                for name, img in frames.items():
+                    cv2.imwrite(str(run_dir / f"debug_{name}.jpg"),
+                                cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+                print(f"[debug] camera frames dumped to {run_dir}/debug_*.jpg")
         return chunk
 
     def execute_chunk(chunk: np.ndarray, kb: KeyboardListener) -> bool:
@@ -507,7 +623,11 @@ def main():
                     break
 
                 if ch == "i":
-                    robot.go_home()
+                    if init_pose is not None:
+                        robot.go_home(joint_target=init_pose["joint_pos"],
+                                      gripper_width=init_pose["gripper_pos_l"])
+                    else:
+                        robot.go_home()
                     pending_chunk = None
                     auto_run = False
                     started = False
@@ -548,12 +668,11 @@ def main():
                         ok = execute_chunk(pending_chunk, kb)
                         pending_chunk = None
                         if ok:
-                            # --safe: keep approval gate ON every chunk
                             auto_run = not args.safe
                             cur = robot.read_state()["ee_pos"]
                             pending_chunk = do_inference(cur)
                             if args.safe:
-                                print("\n[deploy] [SAFE MODE] Press A to approve next chunk, R to reject.\n")
+                                print("\n[deploy] [SAFE] Press A to approve next chunk, R to reject.\n")
                         else:
                             auto_run = False
                             started = False
