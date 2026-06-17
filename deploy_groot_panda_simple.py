@@ -401,6 +401,10 @@ def main():
     p.add_argument("--gripper-speed", type=float, default=0.1)
     p.add_argument("--confirm-real", action="store_true",
                    help="Enable real robot motion. Without this, dry mode only.")
+    p.add_argument("--safe", action="store_true",
+                   help="Require A-key approval before EVERY chunk. Without "
+                        "this, only the first chunk waits and subsequent "
+                        "chunks auto-execute. Use --safe for cautious runs.")
     p.add_argument("--record-dir", default="./runs")
     args = p.parse_args()
 
@@ -544,9 +548,12 @@ def main():
                         ok = execute_chunk(pending_chunk, kb)
                         pending_chunk = None
                         if ok:
-                            auto_run = True
+                            # --safe: keep approval gate ON every chunk
+                            auto_run = not args.safe
                             cur = robot.read_state()["ee_pos"]
                             pending_chunk = do_inference(cur)
+                            if args.safe:
+                                print("\n[deploy] [SAFE MODE] Press A to approve next chunk, R to reject.\n")
                         else:
                             auto_run = False
                             started = False
