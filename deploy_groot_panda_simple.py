@@ -159,10 +159,13 @@ class PandaClient:
         joint_pos = np.asarray(s.q, dtype=np.float32)            # (7,)
         joint_vel = np.asarray(s.dq, dtype=np.float32)           # (7,)
         ee_pos    = np.asarray(self.panda.get_position(), dtype=np.float32)   # (3,)
-        # panda-py returns quaternion in [w, x, y, z]. gr00t expects [x,y,z,w].
+        # panda-py returns quaternion in [w, x, y, z].
+        # NOTE: the LeRobot dataset's ee_quat_x/y/z/w columns are actually
+        # stored in [w,x,y,z] order (the labels lie). So we forward the
+        # panda-py quat as-is into slots labeled x,y,z,w — that matches the
+        # model's training distribution. See build_state_dict.
         q_wxyz = np.asarray(self.panda.get_orientation(), dtype=np.float32)
-        ee_quat_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]],
-                                dtype=np.float32)
+        ee_quat_xyzw = q_wxyz.copy()  # store under "xyzw" slot names verbatim
 
         if self.gripper is not None:
             try:
@@ -204,10 +207,11 @@ class PandaClient:
         self.controller = None
         print("[robot] Controller stopped.")
 
-    def send_ee(self, pos_xyz: np.ndarray, quat_xyzw: np.ndarray):
-        """panda-py controllers want quaternion [w, x, y, z]."""
-        q_wxyz = np.array([quat_xyzw[3], quat_xyzw[0],
-                           quat_xyzw[1], quat_xyzw[2]], dtype=np.float64)
+    def send_ee(self, pos_xyz: np.ndarray, quat_action: np.ndarray):
+        """Send EE target. The model's `quat_action` is already in [w,x,y,z]
+        order (its training labels say xyzw but the dataset stored wxyz).
+        panda-py wants wxyz too, so we pass it through verbatim."""
+        q_wxyz = quat_action.astype(np.float64)
         self.controller.set_control(pos_xyz.astype(np.float64), q_wxyz)
 
     # ── Gripper ──────────────────────────────────────────────────
