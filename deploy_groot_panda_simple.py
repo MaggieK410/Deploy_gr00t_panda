@@ -495,6 +495,11 @@ def main():
                         "disable (always use move()).")
     p.add_argument("--grasp-force", type=float, default=30.0,
                    help="Newtons applied during a grasp() call. Default 30 N.")
+    p.add_argument("--force-grasp-z", type=float, default=None,
+                   help="OVERRIDE: when ee_z drops below this height (m), "
+                        "force a gripper close even if the model says open. "
+                        "Useful for debugging the pickup/lift cycle when the "
+                        "model is stuck in approach. Disabled by default.")
     p.add_argument("--confirm-real", action="store_true",
                    help="Enable real robot motion. Without this, dry mode only.")
     p.add_argument("--safe", action="store_true",
@@ -564,7 +569,12 @@ def main():
             print(f"  joint_vel = {state['joint_vel']}")
             print(f"  ee_pos    = {state['ee_pos']}")
             print(f"  ee_quat (xyzw) = {state['ee_quat']}  |q|={np.linalg.norm(state['ee_quat']):.4f}")
-            print(f"  gripper_w = {state['gripper_width']:.3f}")
+            print(f"  gripper_w (raw, m) = {state['gripper_width']:.3f}")
+            # What actually goes into the model's state dict — confirms it matches
+            # the dataset's recorded gripper_pos_l/r (per-finger half-width).
+            print(f"  → model sees gripper_pos_l = {state['gripper_width']*0.5:.4f}  "
+                  f"gripper_pos_r = {state['gripper_width']*0.5:.4f}  "
+                  f"(dataset open ≈ 0.039, closed ≈ 0.005)")
             if init_pose is not None:
                 jp_drift = state['joint_pos'] - init_pose['joint_pos']
                 ee_drift = state['ee_pos']    - init_pose['ee_pos']
@@ -610,6 +620,11 @@ def main():
             grip_cmd    = float(np.clip(row[7], 0.0, 1.0))
 
             cur = robot.read_state()["ee_pos"]
+            # Optional override: force a gripper close at low z.
+            if args.force_grasp_z is not None and cur[2] <= args.force_grasp_z and grip_cmd > 0.5:
+                print(f"[override] ee_z={cur[2]:.3f} ≤ --force-grasp-z={args.force_grasp_z:.3f}, "
+                      f"forcing grip_cmd 1.0 → 0.0")
+                grip_cmd = 0.0
             target_xyz, clipped = clamp_step(target_xyz, cur,
                                              args.max_step_translation)
             if clipped:
