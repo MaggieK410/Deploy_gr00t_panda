@@ -215,17 +215,29 @@ class PandaClient:
         self.controller.set_control(pos_xyz.astype(np.float64), q_wxyz)
 
     # ── Gripper ──────────────────────────────────────────────────
-    def send_gripper(self, target_width: float, speed: float):
+    def send_gripper(self, target_width: float, speed: float,
+                     grasp_threshold: float = -1.0, grasp_force: float = 30.0):
+        """Move or grasp the gripper.
+
+        If grasp_threshold > 0 and target_width <= grasp_threshold, we issue
+        a `grasp()` call so the gripper applies `grasp_force` N and holds
+        the object. Otherwise we issue a position-only `move()`.
+        """
         if self.gripper is None:
             return
         target_width = float(np.clip(target_width, 0.0, MAX_GRIPPER_WIDTH))
         if abs(target_width - self._last_gripper_width) < 0.005:
             return
         try:
-            self.gripper.move(target_width, speed)
+            if grasp_threshold > 0 and target_width <= grasp_threshold:
+                # epsilon_inner/outer give libfranka the tolerance for "did we grasp?"
+                self.gripper.grasp(target_width, speed, grasp_force,
+                                   0.08, 0.08)
+            else:
+                self.gripper.move(target_width, speed)
             self._last_gripper_width = target_width
         except Exception as e:
-            print(f"[robot] gripper move failed: {e}")
+            print(f"[robot] gripper command failed: {e}")
 
     # ── Home ─────────────────────────────────────────────────────
     def go_home(self, joint_target: np.ndarray | None = None,
@@ -476,6 +488,13 @@ def main():
     p.add_argument("--max-gripper-width", type=float, default=MAX_GRIPPER_WIDTH)
     p.add_argument("--gripper-every", type=int, default=4)
     p.add_argument("--gripper-speed", type=float, default=0.1)
+    p.add_argument("--grasp-threshold", type=float, default=0.04,
+                   help="When the model commands a gripper width <= this (m), "
+                        "switch from move() to grasp() so the gripper applies "
+                        "force and holds the object. Set to 0 or negative to "
+                        "disable (always use move()).")
+    p.add_argument("--grasp-force", type=float, default=30.0,
+                   help="Newtons applied during a grasp() call. Default 30 N.")
     p.add_argument("--confirm-real", action="store_true",
                    help="Enable real robot motion. Without this, dry mode only.")
     p.add_argument("--safe", action="store_true",
@@ -601,7 +620,9 @@ def main():
 
             if i % args.gripper_every == 0:
                 robot.send_gripper(grip_cmd * args.max_gripper_width,
-                                   args.gripper_speed)
+                                   args.gripper_speed,
+                                   grasp_threshold=args.grasp_threshold,
+                                   grasp_force=args.grasp_force)
 
             ch = kb.poll()
             if ch in ("q", "\x1b"):
@@ -628,8 +649,12 @@ def main():
 
                 if ch == "i":
                     if init_pose is not None:
+                        # gripper_pos_l/r in the dataset are per-finger half-widths.
+                        # The total finger gap = L + R. libfranka.Gripper.move() wants
+                        # the full width, so pass the sum.
+                        full_w = init_pose["gripper_pos_l"] + init_pose["gripper_pos_r"]
                         robot.go_home(joint_target=init_pose["joint_pos"],
-                                      gripper_width=init_pose["gripper_pos_l"])
+                                      gripper_width=full_w)
                     else:
                         robot.go_home()
                     pending_chunk = None
